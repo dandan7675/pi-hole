@@ -1,21 +1,31 @@
-/var/log/pihole.log {
-	# su #
-	daily
-	copytruncate
-	rotate 5
-	compress
-	delaycompress
-	notifempty
-	nomail
+/var/log/pihole/pihole.log {
+    # su #
+    daily
+    create 640 pihole pihole
+    rotate 5
+    compress
+    delaycompress
+    notifempty
+    nomail
+    nodateext
+    postrotate
+        . /opt/pihole/utils.sh; pid="$(getFTLPID)"; [ "${pid}" -gt 0 ] && kill -USR2 "${pid}" 2>/dev/null || true
+    endscript
 }
 
-/var/log/pihole-FTL.log {
-	# su #
-	weekly
-	copytruncate
-	rotate 3
-	compress
-	delaycompress
-	notifempty
-	nomail
+/var/log/pihole/FTL.log
+/var/log/pihole/webserver.log {
+    # su #
+    weekly
+    create 640 pihole pihole
+    rotate 3
+    compress
+    delaycompress
+    notifempty
+    nomail
+    nodateext
+    sharedscripts
+    postrotate
+        . /opt/pihole/utils.sh; pid="$(getFTLPID)"; [ "${pid}" -gt 0 ] && kill -USR2 "${pid}" 2>/dev/null || true
+    endscript
 }

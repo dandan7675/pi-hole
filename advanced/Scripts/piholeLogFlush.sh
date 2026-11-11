@@ -9,67 +9,106 @@
 # Please see LICENSE file for your rights under this license.
 
 colfile="/opt/pihole/COL_TABLE"
+# shellcheck source="./advanced/Scripts/COL_TABLE"
 source ${colfile}
 
-# In case we're running at the same time as a system logrotate, use a
-# separate logrotate state file to prevent stepping on each other's
-# toes.
-STATEFILE="/var/lib/logrotate/pihole"
+PI_HOLE_SCRIPT_DIR="/opt/pihole"
+utilsfile="${PI_HOLE_SCRIPT_DIR}/utils.sh"
+# shellcheck source="./advanced/Scripts/utils.sh"
+source "${utilsfile}"
 
-# Determine database location
-# Obtain DBFILE=... setting from pihole-FTL.db
-# Constructed to return nothing when
-# a) the setting is not present in the config file, or
-# b) the setting is commented out (e.g. "#DBFILE=...")
-FTLconf="/etc/pihole/pihole-FTL.conf"
-if [ -e "$FTLconf" ]; then
-    DBFILE="$(sed -n -e 's/^\s*DBFILE\s*=\s*//p' ${FTLconf})"
+# Source api functions
+# shellcheck source="./advanced/Scripts/api.sh"
+. "${PI_HOLE_SCRIPT_DIR}/api.sh"
+
+# Determine log file location
+LOGFILE=$(getFTLConfigValue "files.log.dnsmasq")
+if [ -z "$LOGFILE" ]; then
+    LOGFILE="/var/log/pihole/pihole.log"
 fi
-# Test for empty string. Use standard path in this case.
-if [ -z "$DBFILE" ]; then
-    DBFILE="/etc/pihole/pihole-FTL.db"
+FTLFILE=$(getFTLConfigValue "files.log.ftl")
+if [ -z "$FTLFILE" ]; then
+    FTLFILE="/var/log/pihole/FTL.log"
+fi
+WEBFILE=$(getFTLConfigValue "files.log.webserver")
+if [ -z "$WEBFILE" ]; then
+    WEBFILE="/var/log/pihole/webserver.log"
 fi
 
-if [[ "$@" != *"quiet"* ]]; then
-    echo -ne "  ${INFO} Flushing /var/log/pihole.log ..."
+quiet=false
+if [[ "$*" == *"quiet"* ]]; then
+    quiet=true
 fi
-if [[ "$@" == *"once"* ]]; then
-    # Nightly logrotation
-    if command -v /usr/sbin/logrotate >/dev/null; then
-        # Logrotate once
-        /usr/sbin/logrotate --force --state "${STATEFILE}" /etc/pihole/logrotate
+
+# The log paths come from the pihole-owned config, so never write to them as root
+as_pihole() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        setpriv --reuid=pihole --regid=pihole --init-groups -- "$@"
     else
-        # Copy pihole.log over to pihole.log.1
-        # and empty out pihole.log
-        # Note that moving the file is not an option, as
-        # dnsmasq would happily continue writing into the
-        # moved file (it will have the same file handler)
-        cp -p /var/log/pihole.log /var/log/pihole.log.1
-        echo " " > /var/log/pihole.log
-        chmod 644 /var/log/pihole.log
+        "$@"
+    fi
+}
+
+# Helper function to handle log flushing for a single file
+flush_log() {
+    local logfile="$1"
+    if [[ "${quiet}" != true ]]; then
+        echo -ne "  ${INFO} Flushing ${logfile} ..."
+    fi
+    as_pihole sh -c 'echo " " > "$1" && chmod 640 "$1"' sh "${logfile}"
+    if [ -f "${logfile}.1" ]; then
+        as_pihole sh -c 'echo " " > "$1" && chmod 640 "$1"' sh "${logfile}.1"
+    fi
+    if [[ "${quiet}" != true ]]; then
+        echo -e "${OVER}  ${TICK} Flushed ${logfile} ..."
+    fi
+}
+
+if [[ "$*" == *"once"* ]]; then
+    # Nightly logrotation
+    # Logrotate once
+    if [[ "${quiet}" != true ]]; then
+        echo -ne "  ${INFO} Running logrotate ..."
+    fi
+    # Use logrotate's default state file so this run and the system's own
+    # scheduled logrotate (which also reads /etc/logrotate.d/pihole) agree on
+    # what's already been rotated, instead of rotating our logs twice.
+    logrotate --force /etc/logrotate.d/pihole
+    if [[ "${quiet}" != true ]]; then
+        echo -e "${OVER}  ${TICK} Rotated logs"
     fi
 else
     # Manual flushing
-    if command -v /usr/sbin/logrotate >/dev/null; then
-        # Logrotate twice to move all data out of sight of FTL
-        /usr/sbin/logrotate --force --state "${STATEFILE}" /etc/pihole/logrotate; sleep 3
-        /usr/sbin/logrotate --force --state "${STATEFILE}" /etc/pihole/logrotate
-    else
-        # Flush both pihole.log and pihole.log.1 (if existing)
-        echo " " > /var/log/pihole.log
-        if [ -f /var/log/pihole.log.1 ]; then
-            echo " " > /var/log/pihole.log.1
-            chmod 644 /var/log/pihole.log.1
-        fi
+    flush_log "${LOGFILE}"
+    flush_log "${FTLFILE}"
+    flush_log "${WEBFILE}"
+
+    if [[ "${quiet}" != true ]]; then
+        echo -ne "  ${INFO} Flushing the queries of the last 24 hours ..."
     fi
-    # Delete most recent 24 hours from FTL's database, leave even older data intact (don't wipe out all history)
-    deleted=$(sqlite3 "${DBFILE}" "DELETE FROM queries WHERE timestamp >= strftime('%s','now')-86400; select changes() from queries limit 1")
 
-    # Restart pihole-FTL to force reloading history
-    sudo pihole restartdns
-fi
+    # Authenticate with FTL
+    LoginAPI
 
-if [[ "$@" != *"quiet"* ]]; then
-    echo -e "${OVER}  ${TICK} Flushed /var/log/pihole.log"
-    echo -e "  ${TICK} Deleted ${deleted} queries from database"
+    # FTL drops the queries from memory and from its database while it keeps
+    # running, so DNS stays up and no service manager is needed
+    data=$(PostFTLData "action/flush/logs" "" "status")
+
+    # Separate the status from the data
+    status=$(printf %s "${data#"${data%???}"}")
+    data=$(printf %s "${data%???}")
+
+    # If there is an .error object in the returned data, display it
+    error=$(jq --compact-output <<< "${data}" '.error')
+    if [[ ${error} != "null" && ${error} != "" ]]; then
+        echo -e "${OVER}  ${CROSS} Failed to flush the queries:"
+        echo -e "      $(jq <<< "${data}" '.error')"
+        LogoutAPI
+        exit 1
+    elif [[ "${status}" == "200" && "${quiet}" != true ]]; then
+        echo -e "${OVER}  ${TICK} Flushed the queries of the last 24 hours"
+    fi
+
+    # Delete session
+    LogoutAPI
 fi
